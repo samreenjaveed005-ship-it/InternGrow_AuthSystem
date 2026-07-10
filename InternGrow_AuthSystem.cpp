@@ -1,309 +1,264 @@
 /*
-    InternGrow C++ Programming Track - Task 2
-    Secure User Authentication System
-    ---------------------------------------------------------------
-    Features:
-    - Validate text string inputs (username/password rules)
-    - Check for duplicate usernames
-    - Store credentials securely in external file (hashed passwords)
-    - Upgrade Feature: Lockout mechanism after 3 consecutive
-      failed login attempts, freezes account for a set duration
+    InternGrow C++ Programming Track
+    TASK 2: Secure User Authentication System
+    Feature: Validates inputs, checks duplicate usernames, stores credentials
+             securely (hashed) in an external file.
+    Upgrade: Lockout mechanism - freezes account for a set duration after
+             3 consecutive failed login attempts.
 */
 
 #include <iostream>
 #include <fstream>
 #include <sstream>
-#include <vector>
 #include <string>
 #include <map>
 #include <ctime>
-#include <iomanip>
-#include <functional>
-
+#include <chrono>
+#include <thread>
 using namespace std;
 
-const string USER_FILE = "users.txt";
-const int MAX_FAILED_ATTEMPTS = 3;
-const int LOCKOUT_DURATION_SECONDS = 60; // 1 minute lockout for demo purposes
+const string USER_FILE = "users.txt";        // username,hash,salt
+const string LOCK_FILE  = "lockouts.txt";     // username,failedAttempts,lockUntilEpoch
+const int MAX_ATTEMPTS = 3;
+const int LOCKOUT_SECONDS = 60; // lockout duration (60s for demo; adjust as needed)
 
-// -----------------------------------------------------------------
-// Simple hash function (for demonstration - NOT for production use)
-// In real-world systems, use bcrypt/argon2. Here we use std::hash
-// to avoid storing plain-text passwords in the file.
-// -----------------------------------------------------------------
-string hashPassword(const string& password) {
-    hash<string> hasher;
-    size_t hashed = hasher(password);
+// ---------------- Simple hashing (djb2-based) ----------------
+// NOTE: For real production systems use bcrypt/Argon2. This is a
+// lightweight, dependency-free hash suitable for a learning project.
+unsigned long long simpleHash(const string &input) {
+    unsigned long long hash = 5381;
+    for (char c : input) {
+        hash = ((hash << 5) + hash) + (unsigned char)c; // hash*33 + c
+    }
+    return hash;
+}
+
+string generateSalt(const string &username) {
+    // deterministic-but-unique salt derived from username + fixed pepper
+    return to_string(simpleHash(username + "InternGrow_Pepper_2025"));
+}
+
+string hashPassword(const string &password, const string &salt) {
+    unsigned long long h = simpleHash(password + salt);
     stringstream ss;
-    ss << hex << hashed;
+    ss << hex << h;
     return ss.str();
 }
 
-// -----------------------------------------------------------------
-// User record structure
-// -----------------------------------------------------------------
-struct UserRecord {
-    string username;
-    string hashedPassword;
-    int failedAttempts = 0;
-    time_t lockoutUntil = 0; // 0 means not locked
-};
-
-// -----------------------------------------------------------------
-// Input Validation Helpers
-// -----------------------------------------------------------------
-bool isValidUsername(const string& username) {
-    if (username.length() < 4 || username.length() > 20) return false;
-    for (char c : username) {
-        if (!isalnum(c) && c != '_') return false;
+// ---------------- Input validation ----------------
+bool isValidUsername(const string &u) {
+    if (u.length() < 4 || u.length() > 20) return false;
+    for (char c : u) {
+        if (!isalnum((unsigned char)c) && c != '_') return false;
     }
     return true;
 }
 
-bool isValidPassword(const string& password) {
-    if (password.length() < 6) return false;
-    bool hasDigit = false, hasAlpha = false;
-    for (char c : password) {
-        if (isdigit(c)) hasDigit = true;
-        if (isalpha(c)) hasAlpha = true;
+bool isValidPassword(const string &p) {
+    if (p.length() < 8) return false;
+    bool hasUpper = false, hasLower = false, hasDigit = false;
+    for (char c : p) {
+        if (isupper((unsigned char)c)) hasUpper = true;
+        if (islower((unsigned char)c)) hasLower = true;
+        if (isdigit((unsigned char)c)) hasDigit = true;
     }
-    return hasDigit && hasAlpha;
+    return hasUpper && hasLower && hasDigit;
 }
 
-// -----------------------------------------------------------------
-// AuthSystem class - handles registration, login, file storage
-// -----------------------------------------------------------------
-class AuthSystem {
-private:
-    map<string, UserRecord> users; // in-memory cache, synced with file
-
-    // Load all users from file into memory
-    void loadUsers() {
-        users.clear();
-        ifstream file(USER_FILE);
-        if (!file.is_open()) return;
-
-        string line;
-        while (getline(file, line)) {
-            if (line.empty()) continue;
-            stringstream ss(line);
-            UserRecord u;
-            string failedStr, lockoutStr;
-
-            getline(ss, u.username, '|');
-            getline(ss, u.hashedPassword, '|');
-            getline(ss, failedStr, '|');
-            getline(ss, lockoutStr, '|');
-
-            if (!failedStr.empty()) u.failedAttempts = stoi(failedStr);
-            if (!lockoutStr.empty()) u.lockoutUntil = (time_t)stoll(lockoutStr);
-
-            users[u.username] = u;
-        }
-        file.close();
+// ---------------- File helpers ----------------
+bool usernameExists(const string &username) {
+    ifstream file(USER_FILE);
+    string line;
+    while (getline(file, line)) {
+        stringstream ss(line);
+        string storedUser;
+        getline(ss, storedUser, ',');
+        if (storedUser == username) return true;
     }
+    return false;
+}
 
-    // Save all users from memory back to file
-    void saveUsers() {
-        ofstream file(USER_FILE, ios::trunc);
-        for (const auto& pair : users) {
-            const UserRecord& u = pair.second;
-            file << u.username << "|" << u.hashedPassword << "|"
-                 << u.failedAttempts << "|" << u.lockoutUntil << "\n";
-        }
-        file.close();
-    }
+void saveUser(const string &username, const string &hash, const string &salt) {
+    ofstream file(USER_FILE, ios::app);
+    file << username << "," << hash << "," << salt << "\n";
+}
 
-public:
-    AuthSystem() {
-        loadUsers();
-    }
-
-    bool usernameExists(const string& username) {
-        return users.find(username) != users.end();
-    }
-
-    // -------------------------------------------------------------
-    // REGISTRATION
-    // -------------------------------------------------------------
-    void registerUser() {
-        string username, password, confirmPassword;
-
-        cout << "\n=== New User Registration ===\n";
-        cout << "Username (4-20 chars, letters/digits/underscore only): ";
-        cin >> username;
-
-        if (!isValidUsername(username)) {
-            cout << "Invalid username format. Registration failed.\n";
-            return;
-        }
-
-        if (usernameExists(username)) {
-            cout << "Username already exists. Please choose another.\n";
-            return;
-        }
-
-        cout << "Password (min 6 chars, must include letters and digits): ";
-        cin >> password;
-
-        if (!isValidPassword(password)) {
-            cout << "Password too weak. Must be 6+ chars with letters & digits.\n";
-            return;
-        }
-
-        cout << "Confirm Password: ";
-        cin >> confirmPassword;
-
-        if (password != confirmPassword) {
-            cout << "Passwords do not match. Registration failed.\n";
-            return;
-        }
-
-        UserRecord newUser;
-        newUser.username = username;
-        newUser.hashedPassword = hashPassword(password);
-        newUser.failedAttempts = 0;
-        newUser.lockoutUntil = 0;
-
-        users[username] = newUser;
-        saveUsers();
-
-        cout << "Registration successful! You can now log in.\n";
-    }
-
-    // -------------------------------------------------------------
-    // LOGIN with Lockout Mechanism (Upgrade Feature)
-    // -------------------------------------------------------------
-    void loginUser() {
-        string username, password;
-
-        cout << "\n=== User Login ===\n";
-        cout << "Username: ";
-        cin >> username;
-
-        loadUsers(); // refresh from file in case of updates
-
-        if (!usernameExists(username)) {
-            cout << "Username not found. Please register first.\n";
-            return;
-        }
-
-        UserRecord& user = users[username];
-        time_t now = time(0);
-
-        // Check if account is currently locked
-        if (user.lockoutUntil > now) {
-            int remainingSeconds = (int)(user.lockoutUntil - now);
-            cout << "Account LOCKED due to multiple failed attempts.\n";
-            cout << "Please try again in " << remainingSeconds << " seconds.\n";
-            return;
-        }
-
-        // Lockout period expired - reset failed attempts
-        if (user.lockoutUntil != 0 && user.lockoutUntil <= now) {
-            user.failedAttempts = 0;
-            user.lockoutUntil = 0;
-        }
-
-        cout << "Password: ";
-        cin >> password;
-
-        string hashedInput = hashPassword(password);
-
-        if (hashedInput == user.hashedPassword) {
-            // Successful login
-            user.failedAttempts = 0;
-            user.lockoutUntil = 0;
-            saveUsers();
-            cout << "\nLogin successful! Welcome, " << username << ".\n";
-        } else {
-            // Failed login attempt
-            user.failedAttempts++;
-            cout << "Incorrect password. Attempt " << user.failedAttempts
-                 << " of " << MAX_FAILED_ATTEMPTS << ".\n";
-
-            if (user.failedAttempts >= MAX_FAILED_ATTEMPTS) {
-                user.lockoutUntil = now + LOCKOUT_DURATION_SECONDS;
-                cout << "Account LOCKED for " << LOCKOUT_DURATION_SECONDS
-                     << " seconds due to 3 consecutive failed attempts.\n";
-            } else {
-                int remaining = MAX_FAILED_ATTEMPTS - user.failedAttempts;
-                cout << remaining << " attempt(s) remaining before lockout.\n";
-            }
-
-            saveUsers();
+bool getStoredCredentials(const string &username, string &hash, string &salt) {
+    ifstream file(USER_FILE);
+    string line;
+    while (getline(file, line)) {
+        stringstream ss(line);
+        string storedUser, storedHash, storedSalt;
+        getline(ss, storedUser, ',');
+        getline(ss, storedHash, ',');
+        getline(ss, storedSalt, ',');
+        if (storedUser == username) {
+            hash = storedHash;
+            salt = storedSalt;
+            return true;
         }
     }
+    return false;
+}
 
-    // -------------------------------------------------------------
-    // View all registered users (admin/demo utility)
-    // -------------------------------------------------------------
-    void listUsers() {
-        loadUsers();
-        cout << "\n=== Registered Users ===\n";
-        if (users.empty()) {
-            cout << "No users registered yet.\n";
-            return;
-        }
-
-        cout << left << setw(15) << "Username" << setw(12) << "Failed"
-             << "Status\n";
-        cout << string(45, '-') << "\n";
-
-        time_t now = time(0);
-        for (const auto& pair : users) {
-            const UserRecord& u = pair.second;
-            string status = "Active";
-            if (u.lockoutUntil > now) {
-                status = "LOCKED (" + to_string((int)(u.lockoutUntil - now)) + "s left)";
-            }
-            cout << left << setw(15) << u.username << setw(12) << u.failedAttempts
-                 << status << "\n";
-        }
-    }
+// ---------------- Lockout mechanism (Upgrade Feature) ----------------
+struct LockInfo {
+    int failedAttempts = 0;
+    long long lockUntil = 0; // epoch seconds; 0 = not locked
 };
 
-// -----------------------------------------------------------------
-// Menu-driven interface
-// -----------------------------------------------------------------
-void printMenu() {
-    cout << "\n===================================\n";
-    cout << "   InternGrow Secure Auth System\n";
-    cout << "===================================\n";
-    cout << "1. Register New User\n";
-    cout << "2. Login\n";
-    cout << "3. View All Registered Users\n";
-    cout << "0. Exit\n";
-    cout << "Enter choice: ";
+map<string, LockInfo> loadLockData() {
+    map<string, LockInfo> data;
+    ifstream file(LOCK_FILE);
+    string line;
+    while (getline(file, line)) {
+        stringstream ss(line);
+        string user, attemptsStr, lockUntilStr;
+        getline(ss, user, ',');
+        getline(ss, attemptsStr, ',');
+        getline(ss, lockUntilStr, ',');
+        if (!user.empty()) {
+            LockInfo info;
+            info.failedAttempts = stoi(attemptsStr);
+            info.lockUntil = stoll(lockUntilStr);
+            data[user] = info;
+        }
+    }
+    return data;
+}
+
+void saveLockData(const map<string, LockInfo> &data) {
+    ofstream file(LOCK_FILE, ios::trunc);
+    for (auto &pair : data) {
+        file << pair.first << "," << pair.second.failedAttempts << ","
+             << pair.second.lockUntil << "\n";
+    }
+}
+
+long long currentEpoch() {
+    return (long long)time(nullptr);
+}
+
+// Returns true if the account is currently locked, prints remaining time.
+bool isLocked(const string &username, map<string, LockInfo> &lockData) {
+    auto it = lockData.find(username);
+    if (it == lockData.end()) return false;
+
+    long long now = currentEpoch();
+    if (it->second.lockUntil > now) {
+        long long remaining = it->second.lockUntil - now;
+        cout << "Account locked due to too many failed attempts. "
+             << "Try again in " << remaining << " seconds.\n";
+        return true;
+    } else if (it->second.lockUntil != 0 && it->second.lockUntil <= now) {
+        // Lock expired -> reset
+        it->second.failedAttempts = 0;
+        it->second.lockUntil = 0;
+        saveLockData(lockData);
+    }
+    return false;
+}
+
+void registerFailedAttempt(const string &username, map<string, LockInfo> &lockData) {
+    LockInfo &info = lockData[username];
+    info.failedAttempts++;
+    if (info.failedAttempts >= MAX_ATTEMPTS) {
+        info.lockUntil = currentEpoch() + LOCKOUT_SECONDS;
+        cout << "Too many failed attempts! Account locked for "
+             << LOCKOUT_SECONDS << " seconds.\n";
+    } else {
+        cout << "Incorrect password. Attempts remaining: "
+             << (MAX_ATTEMPTS - info.failedAttempts) << "\n";
+    }
+    saveLockData(lockData);
+}
+
+void resetAttempts(const string &username, map<string, LockInfo> &lockData) {
+    lockData[username] = LockInfo(); // reset to 0 attempts, no lock
+    saveLockData(lockData);
+}
+
+// ---------------- Core actions ----------------
+void registerUser() {
+    string username, password;
+
+    cout << "\n--- Register New User ---\n";
+    cout << "Enter username (4-20 chars, letters/digits/underscore): ";
+    cin >> username;
+
+    if (!isValidUsername(username)) {
+        cout << "Invalid username format.\n";
+        return;
+    }
+    if (usernameExists(username)) {
+        cout << "Username already exists. Choose another.\n";
+        return;
+    }
+
+    cout << "Enter password (min 8 chars, must include upper, lower, digit): ";
+    cin >> password;
+
+    if (!isValidPassword(password)) {
+        cout << "Password does not meet security requirements.\n";
+        return;
+    }
+
+    string salt = generateSalt(username);
+    string hash = hashPassword(password, salt);
+    saveUser(username, hash, salt);
+
+    cout << "Registration successful! You can now log in.\n";
+}
+
+void loginUser() {
+    string username, password;
+    auto lockData = loadLockData();
+
+    cout << "\n--- Login ---\n";
+    cout << "Enter username: ";
+    cin >> username;
+
+    if (isLocked(username, lockData)) {
+        return;
+    }
+
+    if (!usernameExists(username)) {
+        cout << "No such user found.\n";
+        return;
+    }
+
+    cout << "Enter password: ";
+    cin >> password;
+
+    string storedHash, salt;
+    getStoredCredentials(username, storedHash, salt);
+    string attemptHash = hashPassword(password, salt);
+
+    if (attemptHash == storedHash) {
+        cout << "Login successful! Welcome, " << username << ".\n";
+        resetAttempts(username, lockData);
+    } else {
+        registerFailedAttempt(username, lockData);
+    }
 }
 
 int main() {
-    AuthSystem auth;
     int choice;
-
-    cout << "Welcome to InternGrow Secure User Authentication System\n";
-
     do {
-        printMenu();
+        cout << "\n===== Secure Authentication System =====\n";
+        cout << "1. Register\n";
+        cout << "2. Login\n";
+        cout << "3. Exit\n";
+        cout << "Choose an option: ";
         cin >> choice;
 
         switch (choice) {
-            case 1:
-                auth.registerUser();
-                break;
-            case 2:
-                auth.loginUser();
-                break;
-            case 3:
-                auth.listUsers();
-                break;
-            case 0:
-                cout << "Thank you for using InternGrow Auth System!\n";
-                break;
-            default:
-                cout << "Invalid choice. Try again.\n";
+            case 1: registerUser(); break;
+            case 2: loginUser(); break;
+            case 3: cout << "Goodbye!\n"; break;
+            default: cout << "Invalid choice.\n";
         }
-    } while (choice != 0);
+    } while (choice != 3);
 
     return 0;
 }
